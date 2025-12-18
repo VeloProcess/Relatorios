@@ -1,7 +1,7 @@
 import Groq from 'groq-sdk';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import dotenv from 'dotenv';
-import { getIndicators } from '../database.js';
+import { getIndicators } from '../../database.js';
 
 dotenv.config();
 
