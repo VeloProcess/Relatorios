@@ -1,6 +1,7 @@
 import Groq from 'groq-sdk';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import dotenv from 'dotenv';
+import { getIndicators } from '../database.js';
 
 dotenv.config();
 
@@ -29,6 +30,107 @@ if (geminiApiKey) {
 }
 
 const gemini = geminiApiKey ? new GoogleGenerativeAI(geminiApiKey) : null;
+
+// Função para converter tempo hh:mm:ss para segundos
+const timeToSeconds = (timeStr) => {
+  if (!timeStr || typeof timeStr !== 'string') return null;
+  const parts = timeStr.split(':');
+  if (parts.length !== 3) return null;
+  const hours = parseInt(parts[0]) || 0;
+  const minutes = parseInt(parts[1]) || 0;
+  const seconds = parseInt(parts[2]) || 0;
+  return hours * 3600 + minutes * 60 + seconds;
+};
+
+// Função para converter segundos para hh:mm:ss
+const secondsToTime = (totalSeconds) => {
+  if (totalSeconds === null || totalSeconds === undefined || isNaN(totalSeconds)) return '00:00:00';
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+};
+
+// Função para calcular médias de todos os operadores
+const calculateAverages = () => {
+  const allIndicators = getIndicators();
+  
+  // Pegar apenas os indicadores mais recentes de cada operador
+  const latestIndicators = {};
+  allIndicators.forEach(ind => {
+    const opId = ind.operator_id;
+    if (!latestIndicators[opId] || new Date(ind.created_at) > new Date(latestIndicators[opId].created_at)) {
+      latestIndicators[opId] = ind;
+    }
+  });
+
+  const indicatorsArray = Object.values(latestIndicators);
+  if (indicatorsArray.length === 0) return null;
+
+  const averages = {
+    tma: null,
+    calls: null,
+    tickets: null,
+    tmt: null,
+  };
+
+  // Calcular média de TMA (em segundos)
+  const tmaValues = [];
+  indicatorsArray.forEach(ind => {
+    const add = ind.additionalData || ind;
+    const tma = add.tma || ind.tma;
+    if (tma) {
+      const seconds = timeToSeconds(tma);
+      if (seconds !== null) tmaValues.push(seconds);
+    }
+  });
+  if (tmaValues.length > 0) {
+    const avgSeconds = tmaValues.reduce((a, b) => a + b, 0) / tmaValues.length;
+    averages.tma = secondsToTime(Math.round(avgSeconds));
+  }
+
+  // Calcular média de chamadas
+  const callsValues = [];
+  indicatorsArray.forEach(ind => {
+    const calls = ind.calls;
+    if (calls !== null && calls !== undefined && !isNaN(calls)) {
+      callsValues.push(parseInt(calls));
+    }
+  });
+  if (callsValues.length > 0) {
+    averages.calls = Math.round(callsValues.reduce((a, b) => a + b, 0) / callsValues.length);
+  }
+
+  // Calcular média de tickets
+  const ticketsValues = [];
+  indicatorsArray.forEach(ind => {
+    const add = ind.additionalData || ind;
+    const tickets = add.tickets || add.tickets;
+    if (tickets !== null && tickets !== undefined && !isNaN(tickets)) {
+      ticketsValues.push(parseInt(tickets));
+    }
+  });
+  if (ticketsValues.length > 0) {
+    averages.tickets = Math.round(ticketsValues.reduce((a, b) => a + b, 0) / ticketsValues.length);
+  }
+
+  // Calcular média de TMT (em segundos)
+  const tmtValues = [];
+  indicatorsArray.forEach(ind => {
+    const add = ind.additionalData || ind;
+    const tmt = add.tmt || ind.tmt;
+    if (tmt && tmt !== '-' && tmt !== 'Em breve') {
+      const seconds = timeToSeconds(tmt);
+      if (seconds !== null) tmtValues.push(seconds);
+    }
+  });
+  if (tmtValues.length > 0) {
+    const avgSeconds = tmtValues.reduce((a, b) => a + b, 0) / tmtValues.length;
+    averages.tmt = secondsToTime(Math.round(avgSeconds));
+  }
+
+  return averages;
+};
 
 // Função para gerar feedback usando Groq (Principal)
 const generateWithGroq = async (prompt, systemPrompt) => {
@@ -88,163 +190,110 @@ export const generateFeedback = async (operatorData, indicators) => {
       throw new Error('Nenhuma API de IA configurada. Configure GROQ_API_KEY ou GEMINI_API_KEY no Render.');
     }
 
-    // Preparar todas as métricas disponíveis
-    const metrics = [];
+    // Calcular médias de todos os operadores
+    const averages = calculateAverages();
+    console.log('📊 Médias calculadas:', averages);
 
-    // Métricas principais
-    if (indicators.calls !== null && indicators.calls !== undefined) {
-      metrics.push(`Ligações realizadas: ${indicators.calls}`);
-    }
-    if (indicators.tma) {
-      metrics.push(`TMA (Tempo Médio de Atendimento): ${indicators.tma}`);
-    }
-    if (indicators.quality_score !== null && indicators.quality_score !== undefined) {
-      metrics.push(`Pesquisa Telefone: ${indicators.quality_score}`);
-    } else if (indicators.qualityScore !== null && indicators.qualityScore !== undefined) {
-      metrics.push(`Pesquisa Telefone: ${indicators.qualityScore}`);
-    }
-    if (indicators.absenteeism !== null && indicators.absenteeism !== undefined) {
-      metrics.push(`ABS (Absenteísmo): ${indicators.absenteeism}`);
-    }
-
-    // Métricas adicionais - verificar se vem de additionalData ou diretamente do banco
+    // Extrair métricas do operador atual
     const add = indicators.additionalData || indicators;
+    
+    const operatorMetrics = {
+      calls: indicators.calls || null,
+      tma: indicators.tma || add.tma || null,
+      tickets: add.tickets || null,
+      tmt: add.tmt || null,
+      percentLogado: add.percent_logado || add.percentLogado || null,
+      pausaEscalada: add.pausa_escalada || add.pausaEscalada || null,
+      totalPausas: add.total_pausas || add.totalPausas || null,
+      almocoEscalado: add.almoco_escalado || add.almocoEscalado || null,
+      almocoRealizado: add.almoco_realizado || add.almocoRealizado || null,
+      pausa10Escalada: add.pausa10_escalada || add.pausa10Escalada || null,
+      pausa10Realizado: add.pausa10_realizado || add.pausa10Realizado || null,
+      pausaBanheiro: add.pausa_banheiro || add.pausaBanheiro || null,
+      pausaFeedback: add.pausa_feedback || add.pausaFeedback || null,
+    };
 
-    if (add.qtd_pesq_telefone || add.qtdPesqTelefone) metrics.push(`Qtd Pesquisa Telefone: ${add.qtd_pesq_telefone || add.qtdPesqTelefone}`);
-    if (add.tickets) metrics.push(`# Tickets: ${add.tickets}`);
-    if (add.tmt) metrics.push(`TMT: ${add.tmt}`);
-    if (add.pesquisa_ticket || add.pesquisaTicket) metrics.push(`Pesquisa Ticket: ${add.pesquisa_ticket || add.pesquisaTicket}`);
-    if (add.qtd_pesq_ticket || add.qtdPesqTicket) metrics.push(`Qtd Pesquisa Ticket: ${add.qtd_pesq_ticket || add.qtdPesqTicket}`);
-    if (add.nota_qualidade || add.notaQualidade) metrics.push(`Nota Qualidade: ${add.nota_qualidade || add.notaQualidade}`);
-    if (add.qtd_avaliacoes || add.qtdAvaliacoes) metrics.push(`Qtd Avaliações: ${add.qtd_avaliacoes || add.qtdAvaliacoes}`);
-    if (add.total_escalado || add.totalEscalado) metrics.push(`Total Escalado: ${add.total_escalado || add.totalEscalado}`);
-    if (add.total_logado || add.totalLogado) metrics.push(`Total Logado: ${add.total_logado || add.totalLogado}`);
-    if (add.percent_logado || add.percentLogado) metrics.push(`% Logado: ${add.percent_logado || add.percentLogado}`);
-    if (add.atrasos) metrics.push(`Atrasos: ${add.atrasos}`);
-    if (add.pausa_escalada || add.pausaEscalada) metrics.push(`Pausa Escalada: ${add.pausa_escalada || add.pausaEscalada}`);
-    if (add.total_pausas !== null && add.total_pausas !== undefined && add.total_pausas !== '') metrics.push(`Total de Pausas: ${add.total_pausas}`);
-    else if (add.totalPausas !== null && add.totalPausas !== undefined && add.totalPausas !== '') metrics.push(`Total de Pausas: ${add.totalPausas}`);
-    if (add.percent_pausas || add.percentPausas) metrics.push(`% Pausas: ${add.percent_pausas || add.percentPausas}`);
-    if (add.almoco_escalado || add.almocoEscalado) metrics.push(`Almoço Escalado: ${add.almoco_escalado || add.almocoEscalado}`);
-    if (add.almoco_realizado || add.almocoRealizado) metrics.push(`Almoço Realizado: ${add.almoco_realizado || add.almocoRealizado}`);
-    if (add.percent_almoco || add.percentAlmoco) metrics.push(`% Almoço: ${add.percent_almoco || add.percentAlmoco}`);
-    if (add.pausa10_escalada || add.pausa10Escalada) metrics.push(`Pausa 10 Escalada: ${add.pausa10_escalada || add.pausa10Escalada}`);
-    if (add.pausa10_realizado || add.pausa10Realizado) metrics.push(`Pausa 10 Realizado: ${add.pausa10_realizado || add.pausa10Realizado}`);
-    if (add.percent_pausa10 || add.percentPausa10) metrics.push(`% Pausa 10: ${add.percent_pausa10 || add.percentPausa10}`);
-    if (add.pausa_banheiro || add.pausaBanheiro) metrics.push(`Pausa Banheiro: ${add.pausa_banheiro || add.pausaBanheiro}`);
-    if (add.percent_pausa_banheiro || add.percentPausaBanheiro) metrics.push(`% Pausa Banheiro: ${add.percent_pausa_banheiro || add.percentPausaBanheiro}`);
-    if (add.pausa_feedback || add.pausaFeedback) metrics.push(`Pausa Feedback: ${add.pausa_feedback || add.pausaFeedback}`);
-    if (add.percent_pausa_feedback || add.percentPausaFeedback) metrics.push(`% Pausa Feedback: ${add.percent_pausa_feedback || add.percentPausaFeedback}`);
-    if (add.treinamento) metrics.push(`Treinamento: ${add.treinamento}`);
-    if (add.percent_treinamento || add.percentTreinamento) metrics.push(`% Treinamento: ${add.percent_treinamento || add.percentTreinamento}`);
+    // Preparar informações de comparação
+    let comparisonInfo = '';
+    
+    if (averages) {
+      comparisonInfo = '\n\nMÉDIAS DA EQUIPE (para comparação):\n';
+      if (averages.tma) comparisonInfo += `- TMA médio: ${averages.tma}\n`;
+      if (averages.calls) comparisonInfo += `- Chamadas médias: ${averages.calls}\n`;
+      if (averages.tickets) comparisonInfo += `- Tickets médios: ${averages.tickets}\n`;
+      if (averages.tmt) comparisonInfo += `- TMT médio: ${averages.tmt}\n`;
+    }
 
-    const metricsText = metrics.length > 0 ? metrics.join('\n') : 'Nenhuma métrica disponível';
-
-    // Criar mapa de métricas (nome -> valor) para busca rápida
-    const metricsValueMap = {};
-    metrics.forEach(m => {
-      const match = m.match(/^(.+?):\s*(.+)$/);
-      if (match) {
-        const metricName = match[1].trim().toLowerCase();
-        const metricValue = match[2].trim();
-        metricsValueMap[metricName] = metricValue;
-      }
-    });
-
-    const timeMetrics = metrics.filter(m => m.includes('TMA') || m.includes('TMT') || m.includes('Total') || m.includes('Pausa') || m.includes('Almoço') || m.includes('Treinamento')).length;
-    console.log(`📊 Total de métricas: ${metrics.length}, Métricas de tempo: ${timeMetrics}`);
-    console.log(`📋 Mapa de valores criado com ${Object.keys(metricsValueMap).length} entradas`);
-
-    const prompt = `Você é um analista de performance e qualidade. Gere um feedback mensal CONCISO e DETALHADO para um operador de atendimento.
-
-⚠️ ATENÇÃO CRÍTICA: Você DEVE analisar TODAS as ${metrics.length} métricas listadas abaixo, SEM EXCEÇÃO. Não pule nenhuma métrica, especialmente as de TEMPO (formato hh:mm:ss ou hh:mm:ss).
+    const prompt = `Você é um analista de performance. Gere um feedback mensal CONCISO e DIRETO para um operador de atendimento.
 
 OPERADOR:
 - Nome: ${operatorData.name}
-- Cargo: ${operatorData.position}
-- Equipe: ${operatorData.team}
 - Mês de referência: ${operatorData.reference_month || operatorData.referenceMonth}
 
-MÉTRICAS DISPONÍVEIS (você DEVE analisar TODAS - TOTAL: ${metrics.length} métricas):
-${metricsText}
+MÉTRICAS DO OPERADOR:
+${operatorMetrics.calls !== null ? `- Ligações realizadas: ${operatorMetrics.calls}` : ''}
+${operatorMetrics.tma ? `- TMA (Tempo Médio de Atendimento): ${operatorMetrics.tma}` : ''}
+${operatorMetrics.tickets !== null ? `- Tickets: ${operatorMetrics.tickets}` : ''}
+${operatorMetrics.tmt ? `- TMT: ${operatorMetrics.tmt}` : ''}
+${operatorMetrics.percentLogado ? `- % Logado: ${operatorMetrics.percentLogado}` : ''}
+${operatorMetrics.pausaEscalada ? `- Pausa Escalada: ${operatorMetrics.pausaEscalada}` : ''}
+${operatorMetrics.totalPausas ? `- Total de Pausas: ${operatorMetrics.totalPausas}` : ''}
+${operatorMetrics.almocoEscalado ? `- Almoço Escalado: ${operatorMetrics.almocoEscalado}` : ''}
+${operatorMetrics.almocoRealizado ? `- Almoço Realizado: ${operatorMetrics.almocoRealizado}` : ''}
+${operatorMetrics.pausa10Escalada ? `- Pausa 10 Escalada: ${operatorMetrics.pausa10Escalada}` : ''}
+${operatorMetrics.pausa10Realizado ? `- Pausa 10 Realizado: ${operatorMetrics.pausa10Realizado}` : ''}
+${operatorMetrics.pausaBanheiro ? `- Pausa Banheiro: ${operatorMetrics.pausaBanheiro}` : ''}
+${operatorMetrics.pausaFeedback ? `- Pausa Feedback: ${operatorMetrics.pausaFeedback}` : ''}
+${comparisonInfo}
 
-⚠️ ATENÇÃO ESPECIAL PARA MÉTRICAS DE TEMPO:
-- Métricas com formato de TEMPO (ex: "00:04:58", "118:00:00", "12:00:00") DEVEM ser incluídas na análise
-- Preserve EXATAMENTE o formato do tempo como aparece acima (hh:mm:ss ou hh:mm:ss)
-- NÃO converta tempo para números ou outros formatos
-- Exemplos de métricas de TEMPO que DEVEM aparecer: TMA, TMT, Total Escalado, Total Logado, Pausa Escalada, Total de Pausas, Almoço Escalado, Almoço Realizado, Pausa 10 Escalada, Pausa 10 Realizado, Pausa Banheiro, Pausa Feedback, Treinamento
+=== INSTRUÇÕES OBRIGATÓRIAS ===
 
-=== INSTRUÇÕES CRÍTICAS - SIGA EXATAMENTE ===
+Organize o feedback em APENAS 3 TÓPICOS:
 
-1. RESUMO GERAL: Gere um resumo conciso com visão geral do desempenho.
+1. CHAMADAS
+   - Ligações realizadas: Compare com a média da equipe. Se estiver acima da média = MANTER, se abaixo = MELHORAR
+   - TMA: Compare com a média da equipe. Se estiver ABAIXO da média = MANTER (bom), se estiver ACIMA da média = MELHORAR (ruim)
+   - TMT: Compare com a média da equipe. Se estiver ABAIXO da média = MANTER (bom), se estiver ACIMA da média = MELHORAR (ruim)
 
-2. ANÁLISE DE MÉTRICAS - FORMATO OBRIGATÓRIO:
-   Para CADA métrica listada acima, você DEVE seguir EXATAMENTE este formato (sem exceções):
+2. TICKETS
+   - Tickets: Compare com a média da equipe. Se estiver acima da média = MANTER, se abaixo = MELHORAR
 
-   [NOME COMPLETO DA MÉTRICA]
-   Valor: [VALOR EXATO COMO APARECE NAS MÉTRICAS DISPONÍVEIS - COPIE O VALOR EXATO]
-   Status: MANTER
-   
-   Análise: [3-5 linhas explicando o que significa, por que está bom, impacto e contexto]
+3. PAUSAS
+   - % Logado: 
+     * Se for 100% = MANTER (está ótimo)
+     * Se for MENOR que 100% = MELHORAR (pode melhorar)
+     * Se for MAIOR que 100% = MANTER (está ótimo)
+   - Para TODAS as pausas (Pausa Escalada vs Total de Pausas, Almoço Escalado vs Almoço Realizado, Pausa 10 Escalada vs Pausa 10 Realizado, Pausa Banheiro, Pausa Feedback):
+     * Se TEMPO REALIZADO > TEMPO ESCALADO = MELHORAR (está ruim, ultrapassou o tempo permitido)
+     * Se TEMPO REALIZADO < TEMPO ESCALADO = MANTER (está bom, dentro do tempo permitido)
+     * Se TEMPO REALIZADO = TEMPO ESCALADO = MANTER (está bom, no limite)
 
-   OU
+FORMATO OBRIGATÓRIO PARA CADA MÉTRICA:
 
-   [NOME COMPLETO DA MÉTRICA]
-   Valor: [VALOR EXATO COMO APARECE NAS MÉTRICAS DISPONÍVEIS - COPIE O VALOR EXATO]
-   Status: MELHORAR
-   
-   Análise: [3-5 linhas explicando o que significa, por que precisa melhorar, impacto, contexto e sugestões práticas]
+[NOME DA MÉTRICA]
+Valor: [valor exato do operador]
+Média da equipe: [média se disponível, ou "N/A"]
+Status: MANTER ou MELHORAR
+Análise: [2-3 linhas explicando a comparação e o motivo do status]
 
-3. ORGANIZAÇÃO OBRIGATÓRIA:
-   Organize as métricas em seções com títulos em MAIÚSCULAS seguidos de quebra de linha:
-   
-   ATENDIMENTO
-   
-   [Aqui você coloca TODAS as análises das métricas de atendimento: Ligações realizadas, TMA, TMT, # Tickets - cada uma no formato acima]
-   
-   QUALIDADE
-   
-   [Aqui você coloca TODAS as análises das métricas de qualidade: Pesquisa Telefone, Qtd Pesquisa Telefone, Pesquisa Ticket, Qtd Pesquisa Ticket, Nota Qualidade, Qtd Avaliações - cada uma no formato acima]
-   
-   PRESENÇA E DISPONIBILIDADE
-   
-   [Aqui você coloca TODAS as análises: Total Escalado, Total Logado, % Logado, ABS, Atrasos - cada uma no formato acima]
-   
-   PAUSAS E INTERVALOS
-   
-   [Aqui você coloca TODAS as análises de pausas: Pausa Escalada, Total de Pausas, % Pausas, Almoço Escalado, Almoço Realizado, % Almoço, Pausa 10 Escalada, Pausa 10 Realizado, % Pausa 10, Pausa Banheiro, % Pausa Banheiro, Pausa Feedback, % Pausa Feedback - cada uma no formato acima]
-   
-   DESENVOLVIMENTO
-   
-   [Aqui você coloca TODAS as análises: Treinamento, % Treinamento - cada uma no formato acima]
-
-4. VALIDAÇÃO CRÍTICA - VERIFIQUE ANTES DE ENVIAR:
-   ✓ TODAS as ${metrics.length} métricas listadas acima foram analisadas? (VERIFIQUE CADA UMA)
-   ✓ Métricas de TEMPO (TMA, TMT, Total Escalado, Total Logado, Pausa Escalada, Total de Pausas, Almoço Escalado, Almoço Realizado, Pausa 10 Escalada, Pausa 10 Realizado, Pausa Banheiro, Pausa Feedback, Treinamento) foram incluídas?
-   ✓ Cada métrica tem seu valor exato copiado das "MÉTRICAS DISPONÍVEIS" (preserve formato de tempo como "00:04:58" ou "118:00:00")?
-   ✓ Cada métrica tem Status: MANTER ou Status: MELHORAR?
-   ✓ Cada métrica tem Análise: com 3-5 linhas?
-   ✓ As seções estão organizadas com títulos em MAIÚSCULAS?
-   
-   IMPORTANTE: Se uma métrica tem valor de TEMPO (formato hh:mm:ss), você DEVE incluir essa métrica na análise. Não pule métricas de tempo!
-
-5. OUTRAS SEÇÕES:
-   - Pontos Positivos: resumo dos principais pontos positivos
-   - Pontos de Atenção: resumo dos principais pontos que precisam de atenção
-   - Recomendações: recomendações práticas e acionáveis
-   - Modelo de Resposta: texto curto e profissional que o operador pode usar
+EXEMPLO:
+TMA (Tempo Médio de Atendimento)
+Valor: 00:05:30
+Média da equipe: 00:04:20
+Status: MELHORAR
+Análise: O TMA de 5 minutos e 30 segundos está ACIMA da média da equipe (4 minutos e 20 segundos). Isso indica que o operador está demorando mais que o esperado para atender cada ligação, impactando a produtividade. É necessário focar em agilidade e otimização do tempo de atendimento.
 
 Formate a resposta em JSON:
 {
-  "summary": "resumo geral conciso",
-  "metricsAnalysis": "análise DETALHADA seguindo EXATAMENTE o formato acima para CADA métrica listada, organizada por seções com títulos em MAIÚSCULAS. NÃO pule nenhuma métrica. Cada métrica DEVE ter: nome, Valor: [valor exato], Status: MANTER ou MELHORAR, e Análise: [3-5 linhas]",
+  "summary": "resumo geral conciso (máximo 2 parágrafos)",
+  "metricsAnalysis": "análise organizada em 3 seções: CHAMADAS, TICKETS, PAUSAS. Cada métrica deve seguir o formato acima com Valor, Média da equipe, Status e Análise",
   "positivePoints": "pontos positivos resumidos",
   "attentionPoints": "pontos de atenção resumidos",
   "recommendations": "recomendações práticas e acionáveis",
   "operatorResponseModel": "modelo de resposta profissional e curto do operador"
 }`;
 
-    const systemPrompt = 'Você é um analista de performance profissional especializado em feedback construtivo para operadores de atendimento. Siga EXATAMENTE o formato e as regras especificadas no prompt do usuário.';
+    const systemPrompt = 'Você é um analista de performance profissional. Siga EXATAMENTE o formato e as regras especificadas no prompt do usuário. Organize o feedback em apenas 3 tópicos: CHAMADAS, TICKETS e PAUSAS.';
 
     let responseContent;
     let usedProvider = '';
@@ -303,75 +352,7 @@ Formate a resposta em JSON:
       metricsAnalysisText = feedbackData.metricsAnalysis;
     } else if (typeof feedbackData.metricsAnalysis === 'object' && feedbackData.metricsAnalysis !== null) {
       console.log('⚠️ metricsAnalysis veio como objeto, convertendo para string...');
-
-      const sections = feedbackData.metricsAnalysis;
-      const formattedSections = [];
-
-      for (const [sectionName, metricsInSection] of Object.entries(sections)) {
-        formattedSections.push(sectionName);
-        formattedSections.push('');
-
-        for (const [metricName, metricData] of Object.entries(metricsInSection)) {
-          let valor = 'N/A';
-          const metricNameLower = metricName.toLowerCase();
-
-          const metricNameClean = metricNameLower
-            .replace(/\(tempo médio de atendimento\)/gi, '')
-            .replace(/\(/g, '')
-            .replace(/\)/g, '')
-            .trim();
-
-          if (metricsValueMap[metricNameClean]) {
-            valor = metricsValueMap[metricNameClean];
-          } else {
-            for (const [mapKey, mapValue] of Object.entries(metricsValueMap)) {
-              const mapKeyClean = mapKey.replace(/\(.*?\)/g, '').trim();
-              const nameClean = metricNameClean.replace(/\(.*?\)/g, '').trim();
-
-              if (mapKeyClean.includes(nameClean) || nameClean.includes(mapKeyClean)) {
-                valor = mapValue;
-                break;
-              }
-
-              const mapWords = mapKeyClean.split(/\s+/).filter(w => w.length > 2);
-              const nameWords = nameClean.split(/\s+/).filter(w => w.length > 2);
-
-              const commonWords = mapWords.filter(mw => nameWords.some(nw => mw === nw || mw.includes(nw) || nw.includes(mw)));
-              if (commonWords.length >= 2 || (commonWords.length === 1 && commonWords[0].length > 4)) {
-                valor = mapValue;
-                break;
-              }
-            }
-          }
-
-          if (valor === 'N/A') {
-            if (metricData.Valor !== undefined && metricData.Valor !== null && metricData.Valor !== '') {
-              valor = String(metricData.Valor);
-            } else if (metricData.valor !== undefined && metricData.valor !== null && metricData.valor !== '') {
-              valor = String(metricData.valor);
-            } else if (metricData.value !== undefined && metricData.value !== null && metricData.value !== '') {
-              valor = String(metricData.value);
-            }
-          }
-
-          const status = metricData.Status || metricData.status || 'N/A';
-          let analise = 'Análise não disponível';
-          if (metricData.Análise) {
-            analise = metricData.Análise;
-          } else if (metricData.analise) {
-            analise = metricData.analise;
-          }
-
-          formattedSections.push(metricName);
-          formattedSections.push(`Valor: ${valor}`);
-          formattedSections.push(`Status: ${status}`);
-          formattedSections.push('');
-          formattedSections.push(`Análise: ${analise}`);
-          formattedSections.push('');
-        }
-      }
-
-      metricsAnalysisText = formattedSections.join('\n');
+      metricsAnalysisText = JSON.stringify(feedbackData.metricsAnalysis, null, 2);
     } else {
       console.error('⚠️ ATENÇÃO: Campo metricsAnalysis está vazio ou em formato inválido!');
       throw new Error('A IA não gerou a análise detalhada de métricas no formato esperado. Por favor, tente novamente.');
